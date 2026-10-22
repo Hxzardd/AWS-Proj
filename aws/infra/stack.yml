@@ -1,0 +1,481 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Autonomous API optimizer - live demo stack. ALB + two target groups, a primary
+  Auto Scaling group (1..Max t3.micro) and a secondary instance running the demo
+  payment gateway, a shared ElastiCache Redis, the SSM cache-TTL knob, a scoped
+  controller IAM user, and a $1 budget guardrail. Free-tier sized; tear down with
+  aws/infra/teardown.ps1 after the demo.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email for the $1 budget alert and billing notifications.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro]
+    Description: Free-tier eligible instance type.
+  MaxInstances:
+    Type: Number
+    Default: 3
+    Description: Upper bound for the primary Auto Scaling group (keep small for free tier).
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: optimizer-demo }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  Assoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref Subnet1, RouteTableId: !Ref RouteTable }
+  Assoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref Subnet2, RouteTableId: !Ref RouteTable }
+
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB ingress (public HTTP)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Gateway instances (app port from ALB only)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSg }
+  CacheSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis (from gateway instances only)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref AppSg }
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: optimizer demo cache
+      SubnetIds: [!Ref Subnet1, !Ref Subnet2]
+  Cache:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      VpcSecurityGroupIds: [!GetAtt CacheSg.GroupId]
+
+  CacheTtlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /optimizer/cacheTtlSec
+      Type: String
+      Value: "60"
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: gateway
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/optimizer/cacheTtlSec"
+              - Effect: Allow
+                Action: [cloudwatch:PutMetricData]
+                Resource: "*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: optimizer-gateway
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSg]
+        MetadataOptions: { HttpTokens: optional, HttpEndpoint: enabled }
+        UserData:
+          Fn::Base64:
+            Fn::Join:
+              - "\n"
+              - - "#!/bin/bash -xe"
+                - "dnf install -y nodejs"
+                - "mkdir -p /opt/gateway && cd /opt/gateway"
+                - "npm init -y >/dev/null 2>&1 || true"
+                - "npm install ioredis @aws-sdk/client-ssm --no-audit --no-fund"
+                - !Sub "printf 'REDIS_URL=redis://${Cache.RedisEndpoint.Address}:6379\\nAWS_REGION=${AWS::Region}\\nAWS_CACHE_TTL_PARAM=/optimizer/cacheTtlSec\\nPORT=8080\\nPAY_BURN_MS=30\\n' > /opt/gateway/env.sh"
+                - "echo \"INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)\" >> /opt/gateway/env.sh"
+                - "cat > /opt/gateway/server.js <<'GWEOF'"
+                - |-
+                    const http = require("http");
+                    const os = require("os");
+                    const Redis = require("ioredis");
+                    const { SSMClient, GetParameterCommand } = require("@aws-sdk/client-ssm");
+
+                    const PORT = Number(process.env.PORT || 8080);
+                    const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+                    const CACHE_TTL_PARAM = process.env.AWS_CACHE_TTL_PARAM || "/optimizer/cacheTtlSec";
+                    const REGION = process.env.AWS_REGION || "ap-south-1";
+                    const INSTANCE_ID = process.env.INSTANCE_ID || os.hostname();
+                    const BURN_MS = Number(process.env.PAY_BURN_MS || 30);
+                    const HEARTBEAT_MS = 2000;
+                    const HEARTBEAT_TTL = 10;
+
+                    const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
+                    const ssm = new SSMClient({ region: REGION });
+
+                    let cacheTtlSec = 60;
+                    let samples = [];
+                    let reqCount = 0;
+                    let hits = 0;
+                    let misses = 0;
+
+                    let lastCpu = cpuTimes();
+                    function cpuTimes() {
+                      let idle = 0;
+                      let total = 0;
+                      for (const cpu of os.cpus()) {
+                        for (const value of Object.values(cpu.times)) total += value;
+                        idle += cpu.times.idle;
+                      }
+                      return { idle, total };
+                    }
+                    function cpuPercent() {
+                      const now = cpuTimes();
+                      const idle = now.idle - lastCpu.idle;
+                      const total = now.total - lastCpu.total;
+                      lastCpu = now;
+                      return total > 0 ? Math.max(0, Math.min(100, 100 * (1 - idle / total))) : 0;
+                    }
+
+                    function burn(ms) {
+                      const end = Date.now() + ms;
+                      let x = 0;
+                      while (Date.now() < end) x += Math.sqrt(Math.random() * 1e6);
+                      return x;
+                    }
+
+                    function p95(values) {
+                      if (!values.length) return 0;
+                      const sorted = [...values].sort((a, b) => a - b);
+                      return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+                    }
+
+                    const server = http.createServer(async (req, res) => {
+                      const path = (req.url || "/").split("?")[0];
+                      if (path === "/health") {
+                        res.writeHead(200);
+                        return res.end("ok");
+                      }
+                      if (path === "/fleet") return fleet(res);
+
+                      const start = Date.now();
+                      reqCount++;
+                      try {
+                        const id = new URL(req.url, "http://x").searchParams.get("id") || "default";
+                        const key = `pay:${id}`;
+                        const cached = await redis.get(key);
+                        if (cached) {
+                          hits++;
+                        } else {
+                          misses++;
+                          burn(BURN_MS);
+                          await redis.set(key, JSON.stringify({ ok: true, at: Date.now() }), "EX", Math.max(5, cacheTtlSec));
+                        }
+                        const ms = Date.now() - start;
+                        samples.push(ms);
+                        if (samples.length > 500) samples.shift();
+                        res.writeHead(200, { "content-type": "application/json" });
+                        res.end(JSON.stringify({ ok: true, instance: INSTANCE_ID, cached: Boolean(cached), ms }));
+                      } catch {
+                        samples.push(Date.now() - start);
+                        res.writeHead(500);
+                        res.end("error");
+                      }
+                    });
+
+                    async function fleet(res) {
+                      try {
+                        const ids = await redis.smembers("fleet:instances");
+                        const live = [];
+                        for (const id of ids) {
+                          const h = await redis.hgetall(`fleet:hb:${id}`);
+                          if (h && h.ts) live.push(h);
+                          else await redis.srem("fleet:instances", id);
+                        }
+                        const n = live.length || 1;
+                        const sum = (field) => live.reduce((acc, h) => acc + Number(h[field] || 0), 0);
+                        const totalHits = sum("hits");
+                        const totalMiss = sum("misses");
+                        const body = {
+                          p95LatencyMs: Math.max(0, ...live.map((h) => Number(h.p95 || 0))),
+                          latencyMs: sum("avg") / n,
+                          requestRate: sum("rps"),
+                          throughput: sum("rps"),
+                          cpuPct: sum("cpu") / n,
+                          memPct: sum("mem") / n,
+                          cacheHitRatio: totalHits + totalMiss > 0 ? totalHits / (totalHits + totalMiss) : 0.8,
+                          networkLatencyMs: 20,
+                          instanceCount: live.length,
+                        };
+                        res.writeHead(200, { "content-type": "application/json" });
+                        res.end(JSON.stringify(body));
+                      } catch {
+                        res.writeHead(500);
+                        res.end("fleet error");
+                      }
+                    }
+
+                    async function heartbeat() {
+                      const secs = HEARTBEAT_MS / 1000;
+                      const data = {
+                        ts: String(Date.now()),
+                        rps: String(reqCount / secs),
+                        p95: String(p95(samples)),
+                        avg: String(samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0),
+                        cpu: String(cpuPercent()),
+                        mem: String(100 * (1 - os.freemem() / os.totalmem())),
+                        hits: String(hits),
+                        misses: String(misses),
+                      };
+                      reqCount = 0;
+                      hits = 0;
+                      misses = 0;
+                      samples = samples.slice(-200);
+                      try {
+                        await redis.sadd("fleet:instances", INSTANCE_ID);
+                        await redis.hset(`fleet:hb:${INSTANCE_ID}`, data);
+                        await redis.expire(`fleet:hb:${INSTANCE_ID}`, HEARTBEAT_TTL);
+                      } catch {}
+                    }
+
+                    async function pollTtl() {
+                      try {
+                        const out = await ssm.send(new GetParameterCommand({ Name: CACHE_TTL_PARAM }));
+                        const value = Number(out.Parameter && out.Parameter.Value);
+                        if (Number.isFinite(value) && value > 0) cacheTtlSec = value;
+                      } catch {}
+                    }
+
+                    setInterval(heartbeat, HEARTBEAT_MS);
+                    setInterval(pollTtl, 5000);
+                    pollTtl();
+                    server.listen(PORT, () => console.log(`gateway listening on :${PORT} as ${INSTANCE_ID}`));
+                - "GWEOF"
+                - "cat > /etc/systemd/system/gateway.service <<'SVCEOF'"
+                - |-
+                    [Unit]
+                    Description=optimizer demo gateway
+                    After=network-online.target
+                    [Service]
+                    EnvironmentFile=/opt/gateway/env.sh
+                    WorkingDirectory=/opt/gateway
+                    ExecStart=/usr/bin/node /opt/gateway/server.js
+                    Restart=always
+                    [Install]
+                    WantedBy=multi-user.target
+                - "SVCEOF"
+                - "systemctl daemon-reload"
+                - "systemctl enable --now gateway"
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref Subnet1, !Ref Subnet2]
+      SecurityGroups: [!Ref AlbSg]
+  PrimaryTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 8080
+      Protocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "10" }
+  SecondaryTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 8080
+      Protocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "10" }
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PrimaryTg
+  WeightedRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ["/*"] }
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - { TargetGroupArn: !Ref PrimaryTg, Weight: 70 }
+              - { TargetGroupArn: !Ref SecondaryTg, Weight: 30 }
+
+  PrimaryAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: DefaultRoute
+    Properties:
+      MinSize: "1"
+      MaxSize: !Ref MaxInstances
+      DesiredCapacity: "1"
+      VPCZoneIdentifier: [!Ref Subnet1, !Ref Subnet2]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref PrimaryTg]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 150
+      Tags: [{ Key: Name, Value: optimizer-gateway-primary, PropagateAtLaunch: true }]
+  SecondaryAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: DefaultRoute
+    Properties:
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier: [!Ref Subnet1, !Ref Subnet2]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref SecondaryTg]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 150
+      Tags: [{ Key: Name, Value: optimizer-gateway-secondary, PropagateAtLaunch: true }]
+
+  ControllerUser:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: controller
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [autoscaling:SetDesiredCapacity, autoscaling:DescribeAutoScalingGroups]
+                Resource: "*"
+              - Effect: Allow
+                Action: [elasticloadbalancing:ModifyRule, elasticloadbalancing:DescribeRules]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/optimizer/cacheTtlSec"
+              - Effect: Allow
+                Action: [cloudwatch:PutMetricData, cloudwatch:GetMetricData]
+                Resource: "*"
+  ControllerAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref ControllerUser
+
+  Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: optimizer-demo-1usd
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: 1, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref NotificationEmail }
+
+Outputs:
+  EnvBlock:
+    Description: Paste these into .env (then add your controller keys below).
+    Value: !Sub |
+      USE_REAL_AWS=true
+      AWS_REGION=${AWS::Region}
+      AWS_AUTO_SCALING_GROUP_NAME=${PrimaryAsg}
+      AWS_ALB_TARGET_GROUP_ARN=${PrimaryTg}
+      AWS_ALB_SECONDARY_TARGET_GROUP_ARN=${SecondaryTg}
+      AWS_ALB_LISTENER_RULE_ARN=${WeightedRule.RuleArn}
+      AWS_ALB_DNS=${Alb.DNSName}
+      AWS_CLOUDWATCH_NAMESPACE=PaymentGateway/Custom
+      AWS_CACHE_TTL_PARAM=/optimizer/cacheTtlSec
+  AlbDns:
+    Value: !GetAtt Alb.DNSName
+  ControllerAccessKeyId:
+    Value: !Ref ControllerAccessKey
+  ControllerSecretAccessKey:
+    Description: Sensitive - set AWS_SECRET_ACCESS_KEY, then rotate/delete on teardown.
+    Value: !GetAtt ControllerAccessKey.SecretAccessKey

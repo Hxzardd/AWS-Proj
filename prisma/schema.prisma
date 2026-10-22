@@ -1,0 +1,102 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum MetricSource {
+  rl
+  baseline
+}
+
+enum SimulationMode {
+  rl
+  baseline
+  compare
+}
+
+enum RunStatus {
+  running
+  stopped
+  completed
+}
+
+model SimulationRun {
+  id               String           @id @default(cuid())
+  seed             Int
+  mode             SimulationMode
+  status           RunStatus        @default(running)
+  step             Int              @default(0)
+  episode          Int              @default(0)
+  epsilon          Float
+  rlControlState   Json
+  baseControlState Json
+  policySnapshot   Json?
+  startedAt        DateTime         @default(now())
+  endedAt          DateTime?
+  metrics          MetricSnapshot[]
+  actions          AgentAction[]
+
+  @@index([status, startedAt])
+}
+
+model MetricSnapshot {
+  id                 String       @id @default(cuid())
+  runId              String
+  timestamp          DateTime     @default(now())
+  step               Int
+  latencyMs          Float
+  p95LatencyMs       Float
+  throughput         Float
+  cpuPct             Float
+  memPct             Float
+  requestRate        Float
+  networkLatencyMs   Float
+  cacheHitRatio      Float
+  slaViolation       Boolean
+  costPerThousandUsd Float
+  source             MetricSource
+  run                SimulationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, step, source])
+  @@index([runId, source, timestamp])
+}
+
+model AgentAction {
+  id              String       @id @default(cuid())
+  runId           String
+  timestamp       DateTime     @default(now())
+  step            Int
+  stateBucket     Json
+  stateKey        String
+  action          String
+  reason          String       @db.Text
+  rewardResult    Float
+  source          MetricSource
+  effect          Json
+  infrastructure  Json?
+  run             SimulationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId, source, timestamp])
+}
+
+model QTableEntry {
+  id        String   @id @default(cuid())
+  stateKey  String
+  action    String
+  qValue    Float    @default(0)
+  visits    Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  @@unique([stateKey, action])
+  @@index([qValue])
+}
+
+model AppSetting {
+  key       String   @id
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt
+}

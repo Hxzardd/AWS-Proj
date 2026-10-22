@@ -1,0 +1,54 @@
+# Version control and editor metadata
+.git
+.gitignore
+.vscode
+.vs
+.idea
+.agents
+.claude
+.codex
+.openai
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.dev.yaml
+values.dev.yaml
+
+# Dependencies, caches, and generated output
+node_modules
+.next
+.cache
+coverage
+dist
+build
+work
+outputs
+playwright-report
+test-results
+.vinext
+.wrangler
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local databases and OS files
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+Thumbs.db
+
+# Docker and documentation files are not needed inside the image
+Dockerfile*
+docker-compose*.yml
+docker-compose*.yaml
+compose*.yml
+compose*.yaml
+README.md
+LICENSE
