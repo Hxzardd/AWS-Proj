@@ -1,7 +1,13 @@
 param(
   [string]$StackName = "optimizer-demo",
   [string]$Region = "ap-south-1",
-  [Parameter(Mandatory = $true)][string]$NotificationEmail
+  [Parameter(Mandatory = $true)][string]$NotificationEmail,
+  # Must be a Free-Tier-eligible type for brand-new accounts on the restricted
+  # Free Plan. In most regions (incl. ap-south-1) that is t3.micro, NOT t2.micro.
+  # Check with: aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true
+  # The agent's MAX_INSTANCES (.env) should keep the live fleet within your EC2
+  # standard vCPU quota (2 vCPU per t3.micro).
+  [ValidateSet("t2.micro", "t3.micro")][string]$InstanceType = "t3.micro"
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,7 +21,7 @@ aws cloudformation deploy `
   --template-file $template `
   --stack-name $StackName `
   --capabilities CAPABILITY_IAM `
-  --parameter-overrides NotificationEmail=$NotificationEmail `
+  --parameter-overrides NotificationEmail=$NotificationEmail InstanceType=$InstanceType `
   --region $Region
 
 $outputs = aws cloudformation describe-stacks --stack-name $StackName --region $Region `

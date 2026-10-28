@@ -42,6 +42,12 @@ yarn-error.log*
 __pycache__/
 *.pyc
 
+# internal report-prep docs — contain environment secrets (AWS account id,
+# live ALB DNS, personal email, reg. no.); keep out of the public repo
+/REAL_AWS_PROOF.md
+/REPORT_BRIEF.md
+/REPORT_FILL_INS.md
+
 # typescript
 next-env.d.ts
 /dist/

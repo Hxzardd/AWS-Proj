@@ -140,6 +140,10 @@ Resources:
 
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
+    # Explicit dependency so Cache.RedisEndpoint.Address is resolvable when the
+    # UserData is rendered; without it the GetAtt can resolve to an empty string
+    # on first create and the gateway boots with a broken REDIS_URL.
+    DependsOn: Cache
     Properties:
       LaunchTemplateName: optimizer-gateway
       LaunchTemplateData:
@@ -153,6 +157,7 @@ Resources:
             Fn::Join:
               - "\n"
               - - "#!/bin/bash -xe"
+                - "# optimizer gateway bootstrap v2 (forces UserData re-render)"
                 - "dnf install -y nodejs"
                 - "mkdir -p /opt/gateway && cd /opt/gateway"
                 - "npm init -y >/dev/null 2>&1 || true"
